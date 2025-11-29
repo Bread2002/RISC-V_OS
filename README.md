@@ -120,25 +120,25 @@ Initializes stack, trap vectors, prints boot message, jumps to kernel.
 
 Initializes services: console, scheduler, memory, traps, filesystem, user programs.
 
-#### Traps
-
-Includes a full register save/restore, syscall handling, and error reporting.
-
-#### Memory
-
-In-memory system with bump allocation, page allocation, and process memory setup.
-
 #### Scheduler
 
 Cooperative round‑robin with PID assignment and cleanup.
+
+#### Shell
+
+An interactive CLI with command dispatch and user-program execution.
 
 #### Filesystem
 
 A FAT-like structured memory with directories and files, supports various commands.
 
-#### Shell
+#### Memory
 
-An interactive CLI with command dispatch and user-program execution.
+In-memory system with bump allocation, page allocation, and process memory setup.
+
+#### Traps
+
+Includes a full register save/restore, syscall handling, and error reporting for protection.
 
 ---
 
