@@ -34,6 +34,6 @@ delay:
     j       count_loop
     
 done:
-    li a7, 1      # SYSCALL_EXIT
+    li a7, 93      # SYSCALL_EXIT
     ecall
     

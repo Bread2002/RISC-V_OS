@@ -23,7 +23,7 @@ print_loop:
     j       print_loop
 
 done:
-    li      a7, 1          # syscall: exit
+    li      a7, 93          # syscall: exit
     ecall
 
     # Keep data in .text so it’s included in the flat binary
