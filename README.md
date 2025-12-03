@@ -5,7 +5,7 @@
 
 ### 📌 Project Overview
 
-**RISC-V OS** is a compact, modular operating system designed for bare-metal RISC-V environments. It boots from a handwritten assembly loader, enters Supervisor mode, initializes a lightweight kernel, mounts a virtual in-memory FAT-style filesystem, and launches a cooperative scheduler that manages both system tasks and embedded user programs.
+**RISC-V OS** is a compact, modular operating system designed for bare-metal RISC-V environments. It boots from a handwritten assembly loader, enters Supervisor mode, initializes a lightweight kernel, mounts a virtual in-memory FAT-style filesystem, and launches a cooperative scheduler that manages both system tasks and embedded user programs. The project itself was developed with assistance from large language models (LLMs), including Claude and ChatGPT, to accelerate design exploration, refine system architecture, and streamline debugging throughout the build process.
 
 In addition to built-in components, the OS also supports user-provided assembly programs: any `.S` files embedded prior to boot are automatically detected, converted into internal binary/ source pairs, and written into the virtual filesystem under `/user_programs` during startup. This allows developers to inject custom user programs directly into the image and have them appear as local files at runtime, ready to be inspected or executed via the shell.
 
