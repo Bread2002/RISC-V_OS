@@ -164,4 +164,5 @@ Includes a full register save/restore, syscall handling, and error reporting for
     └── user_programs/  # Upload user programs here
         ├── hello.S
         ├── counter.S
-        └── fibonacci.S
+        ├── fibonacci.S
+        └── simple_sem.S
