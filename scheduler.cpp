@@ -1,6 +1,6 @@
 /* Copyright (c) 2025, Rye Stahle-Smith
 December 2nd, 2025 - scheduler.cpp
-Description: Cooperative RISC-V process scheduler implementing PID management, process creation, state transitions, yielding, and round-robin task selection. */
+Description: Process scheduler with semaphore synchronization, blocking/waking, and concurrent round-robin execution. */
 #include "scheduler.h"
 #include "shell.h"
 #include "memory.h"
@@ -12,8 +12,18 @@ Process proc_table[MAX_PROCS];
 static int next_pid = 1;
 int current = -1;
 
+// Semaphore table
+static Semaphore sem_table[MAX_SEMS];
+static int next_sem_id = 1;
+
+// Kernel state
 uintptr_t kernel_saved_sp;
 uintptr_t kernel_resume_pc;
+
+// Memory barrier for visibility
+static void memory_barrier() {
+    asm volatile("fence rw,rw" ::: "memory");
+}
 
 // ---------------------------------------------------------------------
 // Internal helpers
@@ -33,37 +43,41 @@ static Process* find_free_slot() {
     return nullptr;
 }
 
+static Semaphore* find_free_sem_slot() {
+    for (int i = 0; i < MAX_SEMS; ++i) {
+        if (!sem_table[i].in_use) return &sem_table[i];
+    }
+    return nullptr;
+}
+
 static Process* find_next_ready(int start_idx) {
-    // 1. First search for RUNNING processes (round-robin)
+    // Search for next READY or RUNNING process, skipping blocked processes
     for (int offset = 0; offset < MAX_PROCS; ++offset) {
         int i = (start_idx + offset) % MAX_PROCS;
-        if (proc_table[i].state == PROC_RUNNING)
+        if (proc_table[i].state == PROC_READY || proc_table[i].state == PROC_RUNNING)
             return &proc_table[i];
     }
-
-    // 2. If none RUNNING, search for READY processes
-    for (int offset = 0; offset < MAX_PROCS; ++offset) {
-        int i = (start_idx + offset) % MAX_PROCS;
-        if (proc_table[i].state == PROC_READY)
-            return &proc_table[i];
-    }
-
     return nullptr;
 }
 
 void terminate_process(int pid) {
     Process* p = pid_to_proc(pid);
-    if (!p) return;
-    p->state = PROC_ZOMBIE;
+    if (p) {
+        p->state = PROC_ZOMBIE;
+    }
 }
 
-// Simple stack switch runner:
-// Save current kernel sp, switch to proc->stack_top, call proc->entry,
-// on return restore kernel sp.
+// Simple stack switch runner
 static void run_process(Process* p) {
     if (!p || !p->entry) return;
 
-    print_str("(scheduler) Starting process...\n");
+    print_str("(scheduler) Starting process '");
+    print_str(p->name);
+    print_str("' [PID ");
+    char pid_str[16];
+    itoa(p->pid, pid_str, 10);
+    print_str(pid_str);
+    print_str("]...\n");
 
     uintptr_t saved_sp;
     asm volatile("mv %0, sp" : "=r"(saved_sp));
@@ -75,7 +89,9 @@ static void run_process(Process* p) {
     current = p->pid;
 
     p->state = PROC_RUNNING;
-    p->entry();          // either returns, or triggers ecall + trap
+    memory_barrier();
+    
+    p->entry();  // either returns, or triggers ecall + trap
 
     scheduler_process_return();
 }
@@ -83,10 +99,11 @@ static void run_process(Process* p) {
 extern "C" void scheduler_process_return() {
     // Restore kernel stack
     asm volatile("mv sp, %0" :: "r"(kernel_saved_sp));
+    memory_barrier();
 
-    // Free resources for previous process
-    Process* p = scheduler_get_proc_by_pid(current);
-    if (p->state == PROC_ZOMBIE) {
+    // Free resources for previous process if zombie
+    Process* p = pid_to_proc(current);
+    if (p && p->state == PROC_ZOMBIE) {
         p->state = PROC_FREE;
         p->pid = 0;
         p->entry = nullptr;
@@ -94,31 +111,45 @@ extern "C" void scheduler_process_return() {
         p->stack = nullptr;
         p->stack_top = nullptr;
         p->stack_size = 0;
+        p->blocked_sem_id = -1;
+        p->next_blocked = nullptr;
     }
 
-    // Return to shell
-    p = find_next_ready(0);
-    if (p) {
-        current = p->pid;
+    current = -1;
+}
 
-        if (p->name && strcmp(p->name, "shell") == 0) {
-            p->state = PROC_RUNNING;  // Keep it running
-            // Don't mark as ZOMBIE
-        } else {
-            // If the process yielded, it should remain READY; otherwise mark as ZOMBIE
-            if (p->state == PROC_RUNNING)
-                p->state = PROC_READY;
-            else if (p->state != PROC_ZOMBIE)
-                p->state = PROC_ZOMBIE;
-        }
+// Block a process on a semaphore and add to blocked list
+static void block_on_semaphore(Process* p, int sem_id) {
+    Semaphore* sem = sem_get(sem_id);
+    if (!sem) {
+        return;
     }
+
+    p->state = PROC_BLOCKED_SEM;
+    p->blocked_sem_id = sem_id;
+    p->next_blocked = sem->blocked_list;
+    sem->blocked_list = p;
+}
+
+// Wake one blocked process from a semaphore
+static void wake_one_from_semaphore(int sem_id) {
+    Semaphore* sem = sem_get(sem_id);
+    if (!sem || !sem->blocked_list) {
+        return;
+    }
+
+    // Wake the first blocked process
+    Process* p = sem->blocked_list;
+    sem->blocked_list = p->next_blocked;
+    p->next_blocked = nullptr;
+    p->state = PROC_READY;
+    p->blocked_sem_id = -1;
 }
 
 // ---------------------------------------------------------------------
-// Public API
+// Public API - Process Management
 // ---------------------------------------------------------------------
 bool scheduler_init() {
-    // initialize process table
     for (int i = 0; i < MAX_PROCS; ++i) {
         proc_table[i].pid = 0;
         proc_table[i].name = nullptr;
@@ -127,21 +158,36 @@ bool scheduler_init() {
         proc_table[i].stack_top = nullptr;
         proc_table[i].stack_size = 0;
         proc_table[i].state = PROC_FREE;
+        proc_table[i].blocked_sem_id = -1;
+        proc_table[i].next_blocked = nullptr;
     }
+
+    for (int i = 0; i < MAX_SEMS; ++i) {
+        sem_table[i].id = 0;
+        sem_table[i].value = 0;
+        sem_table[i].owner_pid = 0;
+        sem_table[i].blocked_list = nullptr;
+        sem_table[i].in_use = false;
+    }
+
     next_pid = 1;
+    next_sem_id = 1;
     current = -1;
     return true;
 }
 
 int create_process(void (*entry)(), const char* name, uint32_t stack_size) {
     Process* slot = find_free_slot();
-    if (!slot) return -1;
+    if (!slot) {
+        return -1;
+    }
 
     int slot_idx = slot - proc_table;
 
-    // allocate stack...
     void* stk = kmalloc(stack_size);
-    if (!stk) return -1;
+    if (!stk) {
+        return -1;
+    }
 
     slot->pid = next_pid++;
     slot->entry = entry;
@@ -149,8 +195,9 @@ int create_process(void (*entry)(), const char* name, uint32_t stack_size) {
     slot->stack_size = stack_size;
     slot->stack_top = slot->stack + slot->stack_size;
     slot->stack_top = (uint8_t*)((uintptr_t)slot->stack_top & ~0xFULL);
+    slot->blocked_sem_id = -1;
+    slot->next_blocked = nullptr;
 
-    // copy name into persistent global buffer
     const char* src = name ? name : "proc";
     int j = 0;
     while (src[j] && j < (int)sizeof(proc_name_buf[0]) - 1) {
@@ -163,7 +210,7 @@ int create_process(void (*entry)(), const char* name, uint32_t stack_size) {
     slot->state = PROC_READY;
 
     char pid_str[16];
-    itoa(slot->pid, pid_str);
+    itoa(slot->pid, pid_str, 10);
     print_str("(scheduler) Process created for '");
     print_str(name);
     print_str("' [PID ");
@@ -173,16 +220,16 @@ int create_process(void (*entry)(), const char* name, uint32_t stack_size) {
     return slot->pid;
 }
 
-// Add after existing functions, before scheduler_main
-int create_process_from_binary(const uint8_t* binary, uint32_t binary_size, 
+int create_process_from_binary(const uint8_t* binary, uint32_t binary_size,
                                 const char* name, uint32_t stack_size) {
     Process* slot = find_free_slot();
-    if (!slot) return -1;
+    if (!slot) {
+        return -1;
+    }
 
     int slot_idx = slot - proc_table;
 
-    // Allocate memory for code + stack
-    uint32_t code_size = (binary_size + 15) & ~15ULL; // align to 16 bytes
+    uint32_t code_size = (binary_size + 15) & ~15ULL;
     void* code_mem = kmalloc(code_size);
     if (!code_mem) {
         print_str("(scheduler) Failed to allocate code memory\n");
@@ -195,17 +242,17 @@ int create_process_from_binary(const uint8_t* binary, uint32_t binary_size,
         return -1;
     }
 
-    // Copy binary into allocated memory
     memcpy(code_mem, binary, binary_size);
 
     slot->pid = next_pid++;
-    slot->entry = (void(*)())code_mem;  // Entry point is start of code
+    slot->entry = (void(*)())code_mem;
     slot->stack = (uint8_t*)stack_mem;
     slot->stack_size = stack_size;
     slot->stack_top = slot->stack + slot->stack_size;
     slot->stack_top = (uint8_t*)((uintptr_t)slot->stack_top & ~0xFULL);
+    slot->blocked_sem_id = -1;
+    slot->next_blocked = nullptr;
 
-    // Copy name into persistent buffer
     const char* src = name ? name : "userproc";
     int j = 0;
     while (src[j] && j < (int)sizeof(proc_name_buf[0]) - 1) {
@@ -218,7 +265,7 @@ int create_process_from_binary(const uint8_t* binary, uint32_t binary_size,
     slot->state = PROC_READY;
 
     char pid_str[16];
-    itoa(slot->pid, pid_str);
+    itoa(slot->pid, pid_str, 10);
     print_str("(scheduler) Process created for '");
     print_str(name);
     print_str("' [PID ");
@@ -229,10 +276,6 @@ int create_process_from_binary(const uint8_t* binary, uint32_t binary_size,
 }
 
 void schedule_yield() {
-    // Cooperative yield stub:
-    // For now, do nothing. In the future: save registers and switch to scheduler.
-    // Processes should simply return or call a syscall to yield.
-    // (We keep this API so later user processes can call schedule_yield()).
     asm volatile("nop");
 }
 
@@ -245,46 +288,124 @@ int scheduler_proc_count() {
 }
 
 Process* scheduler_get_process_table() {
-    return proc_table; // proc_table can remain static
+    return proc_table;
 }
 
 int scheduler_get_max_procs() {
     return MAX_PROCS;
 }
 
-// find process by pid (public)
 Process* scheduler_get_proc_by_pid(int pid) {
     return pid_to_proc(pid);
 }
 
-// run process by pid (blocking)
 int scheduler_run_pid(int pid) {
     Process *p = pid_to_proc(pid);
     if (!p) return -1;
-
-    // We need to call the internal run_process; it's currently static.
-    // If you keep run_process static, move this wrapper into the same .cpp file
-    // so it can call run_process(p). If you move run_process to non-static, keep care.
     run_process(p);
-    print_str("(scheduler) Process finished or exited...\n");
     return 0;
 }
 
 // ---------------------------------------------------------------------
-// scheduler_main - very small loop for initial testing
-// - If no processes exist, create the shell process
-// - Run ready processes one by one (cooperative)
+// Public API - Semaphore Management
+// Note: In cooperative multitasking, we don't need locks around these
+// because processes only yield at explicit points (ecall)
+// ---------------------------------------------------------------------
+int sem_create(int initial_value) {
+    Semaphore* slot = find_free_sem_slot();
+    if (!slot) {
+        return -1;
+    }
+
+    int sem_id = next_sem_id++;
+    slot->id = sem_id;
+    slot->value = initial_value;
+    slot->owner_pid = current;
+    slot->blocked_list = nullptr;
+    slot->in_use = true;
+
+    return sem_id;
+}
+
+void sem_wait(int sem_id) {
+    Semaphore* sem = sem_get(sem_id);
+    if (!sem) {
+        return;
+    }
+
+    sem->value--;
+
+    if (sem->value < 0) {
+        // Block this process
+        Process* p = pid_to_proc(current);
+        if (p) {
+            p->state = PROC_BLOCKED_SEM;
+            p->blocked_sem_id = sem_id;
+            p->next_blocked = sem->blocked_list;
+            sem->blocked_list = p;
+        }
+        
+        // Jump back to scheduler
+        asm volatile("mv sp, %0" :: "r"(kernel_saved_sp));
+        asm volatile("jr %0" :: "r"(kernel_resume_pc));
+        // Never reaches here
+    }
+}
+
+void sem_signal(int sem_id) {
+    Semaphore* sem = sem_get(sem_id);
+    if (!sem) {
+        return;
+    }
+
+    sem->value++;
+
+    // If there are blocked processes, wake one
+    if (sem->value <= 0 && sem->blocked_list) {
+        Process* p = sem->blocked_list;
+        sem->blocked_list = p->next_blocked;
+        p->next_blocked = nullptr;
+        p->state = PROC_READY;
+        p->blocked_sem_id = -1;
+    }
+}
+
+bool sem_destroy(int sem_id) {
+    for (int i = 0; i < MAX_SEMS; ++i) {
+        if (sem_table[i].id == sem_id && sem_table[i].in_use) {
+            sem_table[i].in_use = false;
+            sem_table[i].id = 0;
+            sem_table[i].value = 0;
+            sem_table[i].blocked_list = nullptr;
+            return true;
+        }
+    }
+    return false;
+}
+
+Semaphore* sem_get(int sem_id) {
+    for (int i = 0; i < MAX_SEMS; ++i) {
+        if (sem_table[i].id == sem_id && sem_table[i].in_use) {
+            return &sem_table[i];
+        }
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------
+// scheduler_main - Concurrent round-robin with blocking support
 // ---------------------------------------------------------------------
 void scheduler_main() {
-    print_str("(scheduler) Entering main loop...\n");
+    print_str("(scheduler) Entering main loop with concurrent support...\n");
 
-    // ensure scheduler initialized
     scheduler_init();
 
-    // If there are no processes, create the shell as a process
     bool has_any = false;
     for (int i = 0; i < MAX_PROCS; ++i) {
-        if (proc_table[i].state != PROC_FREE) { has_any = true; break; }
+        if (proc_table[i].state != PROC_FREE) {
+            has_any = true;
+            break;
+        }
     }
     if (!has_any) {
         int pid = create_process((void(*)())shell_main, "shell", DEFAULT_STACK_SIZE);
@@ -293,25 +414,17 @@ void scheduler_main() {
         }
     }
 
-    // Very simple cooperative round robin:
-    while (1) {
-        // find the next ready process (if current == -1, start at -1 so first = 0)
-        int start_idx = 0;
-        if (current > 0) {
-            // find index of current pid
-            for (int i = 0; i < MAX_PROCS; ++i) {
-                if (proc_table[i].pid == current) { start_idx = i; break; }
-            }
-        } else {
-            start_idx = 0;
-        }
+    int start_idx = 0;
 
+    while (1) {
         Process* next = find_next_ready(start_idx);
+        
         if (next) {
-            // Run it until it returns (cooperative)
+            int next_idx = next - proc_table;
+            start_idx = (next_idx + 1) % MAX_PROCS;
             run_process(next);
         } else {
-            // No ready processes: idle - spin or wait for interrupts
+            // No ready processes: idle
             asm volatile("wfi");
         }
     }
